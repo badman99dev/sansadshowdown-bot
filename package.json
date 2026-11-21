@@ -1,0 +1,26 @@
+{
+  "name": "sansadshowdown-bot",
+  "version": "1.0.0",
+  "description": "Headless Node.js bot for fightkaro.com (Sansad Showdown) online 1v1 — joins a friend's room by code and plays using the game's own CPU AI.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "bot": "node index.js",
+    "selftest": "node selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "fightkaro",
+    "sansadshowdown",
+    "webrtc",
+    "bot",
+    "werift"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "werift": "^0.28.0",
+    "ws": "^8.23.0"
+  }
+}

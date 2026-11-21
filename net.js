@@ -1,0 +1,184 @@
+'use strict';
+// Online-room client for Sansad Showdown, pure Node (no browser).
+// Mirrors the guest side of the game's rooms module (class M / Room) on top of
+// werift's RTCPeerConnection.
+
+const { RTCPeerConnection } = require('werift');
+
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+function normalizeCode(raw) {
+  if (typeof raw !== 'string') return null;
+  const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (t.length !== 4) return null;
+  for (const ch of t) if (!CODE_ALPHABET.includes(ch)) return null;
+  return t;
+}
+
+function pct(s) {
+  if (!s) return 'no candidates';
+  const all = [...s.matchAll(/a=candidate:.* typ (\w+)/g)].map((m) => m[1]);
+  const n = (k) => all.filter((x) => x === k).length;
+  return `${all.length} candidates: host ${n('host')}, srflx ${n('srflx')}, relay ${n('relay')}`;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchJson(url, opts = {}, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    if (!res.ok) {
+      const err = new Error((data && data.error) || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+class Room {
+  constructor(pc, ctrl, input, opts) {
+    this.pc = pc;
+    this.ctrl = ctrl;
+    this.input = input;
+    this.log = opts.log || (() => {});
+    this.onCtrl = opts.onCtrl || (() => {});
+    this.onInput = opts.onInput || (() => {});
+    this.onClose = opts.onClose || (() => {});
+    this.closed = false;
+    this.sid = null;
+    this._pingSeq = 0;
+    this._pings = new Map();
+
+    ctrl.onopen = () => this.log('ctrl channel open');
+    input.onopen = () => this.log('input channel open');
+    ctrl.onmessage = (ev) => this._onCtrl(ev.data);
+    input.onmessage = (ev) => {
+      try { this.onInput(ev.data); } catch (e) { this.log('onInput error: ' + e.message); }
+    };
+    ctrl.onclose = () => this._end('ctrl closed');
+    input.onclose = () => this._end('input closed');
+
+    this._pingTimer = setInterval(() => this._ping(), 500);
+  }
+
+  _ping() {
+    if (this.closed) return;
+    const id = ++this._pingSeq;
+    this._pings.set(id, performance.now());
+    if (this._pings.size > 50) this._pings.delete(this._pings.keys().next().value);
+    this.send({ t: 'ping', id });
+  }
+
+  latency() {
+    if (!this._rtts || !this._rtts.length) return null;
+    const s = [...this._rtts].sort((a, b) => a - b);
+    return Math.round(s[Math.floor(s.length / 2)]);
+  }
+
+  _onCtrl(raw) {
+    let m;
+    try { m = JSON.parse(raw); } catch { return; }
+    if (!m) return;
+    if (m.t === 'ping') { this.send({ t: 'pong', id: m.id, sent: m.sent, at: performance.now() }); return; }
+    if (m.t === 'pong') {
+      const sent = this._pings.get(m.id);
+      if (sent !== undefined) {
+        this._pings.delete(m.id);
+        this._rtts = this._rtts || [];
+        this._rtts.push(performance.now() - sent);
+        if (this._rtts.length > 40) this._rtts.shift();
+      }
+      return;
+    }
+    if (m.t === 'sid') { this.sid = m.sid; return; }
+    this.onCtrl(m);
+  }
+
+  send(obj) {
+    if (this.closed) return;
+    if (this.ctrl.readyState !== 'open') return;
+    try { this.ctrl.send(JSON.stringify(obj)); } catch (e) { this.log('send ctrl error: ' + e.message); }
+  }
+
+  sendInput(buf) {
+    if (this.closed || this.input.readyState !== 'open') return;
+    if (this.input.bufferedAmount >= 16384) return;
+    try { this.input.send(buf); } catch (e) { this.log('send input error: ' + e.message); }
+  }
+
+  _end(why) {
+    if (this.closed) return;
+    this.closed = true;
+    clearInterval(this._pingTimer);
+    this.log('room ended: ' + why);
+    this.onClose(why);
+  }
+
+  close() { this._end('local close'); try { this.ctrl.close(); this.input.close(); this.pc.close(); } catch {} }
+}
+
+async function joinRoom({ baseUrl, code, iceUrl, log = () => {} }) {
+  const norm = normalizeCode(code);
+  if (!norm) throw new Error('Invalid room code (4 letters/digits)');
+
+  log(`joining room ${norm} ...`);
+  let data;
+  try {
+    data = await fetchJson(`${baseUrl}/api/room/join?code=${encodeURIComponent(norm)}`);
+  } catch (e) {
+    if (e.status === 404) throw new Error('Room not found or expired. Ask the host for a fresh code.');
+    if (e.status === 409) throw new Error('Room is already full.');
+    throw e;
+  }
+  const offer = data.offer;
+  const ice = data.ice || (await fetchJson(`${baseUrl}/api/ice`).catch(() => null));
+  const iceServers = (ice && ice.iceServers) || [{ urls: 'stun:stun.l.google.com:19302' }];
+  log(`ICE: ${iceServers.length} server(s)${ice && ice.relay ? ' (with TURN relay)' : ' (STUN only)'}`);
+  log(`host offer: ${pct(offer.sdp)}`);
+
+  const pc = new RTCPeerConnection({ iceServers });
+  pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
+  pc.oniceconnectionstatechange = () => log(`ice: ${pc.iceConnectionState}`);
+
+  const ctrl = pc.createDataChannel('ctrl', { negotiated: true, id: 0, ordered: true });
+  const input = pc.createDataChannel('input', { negotiated: true, id: 1, ordered: false, maxRetransmits: 0 });
+
+  await pc.setRemoteDescription({ type: offer.type || 'offer', sdp: offer.sdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  // wait for ICE gathering to settle so the answer carries our candidates
+  const t0 = Date.now();
+  while (pc.iceGatheringState !== 'complete' && Date.now() - t0 < 6000) await sleep(100);
+  const local = pc.localDescription;
+  log(`our answer: ${pct(local.sdp)}`);
+
+  const room = new Room(pc, ctrl, input, { log });
+  await fetchJson(`${baseUrl}/api/room/answer?code=${encodeURIComponent(norm)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ answer: { type: local.type, sdp: local.sdp } }),
+  });
+  log('answer sent, waiting for peer...');
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Could not connect (relay/TURN may be required)')), 45000);
+    const check = () => {
+      if (ctrl.readyState === 'open' && input.readyState === 'open') { clearTimeout(timer); resolve(); }
+    };
+    ctrl.onopen = () => { log('ctrl open'); check(); };
+    input.onopen = () => { log('input open'); check(); };
+    check();
+  });
+  log('connected to host ✓');
+  return room;
+}
+
+module.exports = { joinRoom, normalizeCode, Room };
