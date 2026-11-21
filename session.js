@@ -113,11 +113,24 @@ function startSession(opts = {}) {
           case 'lobby':
             state.hostPick = m.pick;
             say(`host lobby (pick=${m.pick}, ready=${!!m.ready})`);
+            // The host returns to the lobby after a match ends. Drop back into the
+            // lobby phase and re-send our readies so a rematch can start.
+            if (state.started) {
+              state.started = false;
+              state.round = 1;
+              state.ourHp = 100; state.oppHp = 100;
+              state.status = state.paused ? 'paused' : 'connected';
+              emit({ t: 'status', id, status: state.status });
+              say('match over — back in lobby, re-readying for rematch');
+              sendLobby();
+            }
             break;
           case 'start':
             state.ourChar = m.guest || state.ourPick;
             state.oppChar = m.host || state.hostPick;
             state.started = true;
+            state.round = 1;
+            state.ourHp = 100; state.oppHp = 100;
             state.status = state.paused ? 'paused' : 'fighting';
             emit({ t: 'status', id, status: state.status });
             say(`FIGHT! we=${state.ourChar} vs host=${state.oppChar} (stage ${m.stage})`);
@@ -125,7 +138,21 @@ function startSession(opts = {}) {
           case 'ev':
             if (m.e === 'round') { state.round++; say(`round ${state.round}`); }
             else if (m.e === 'ko') say('KO!');
-            else if (m.e === 'roundEnd') say(`round end: winner=${m.outcome} timeUp=${m.timeUp}`);
+            else if (m.e === 'roundEnd') say(`round end: winner=${m.outcome} perfect=${m.perfect} timeUp=${m.timeUp} (score ${m.score ? m.score.join('-') : '?'})`);
+            else if (m.e === 'phase') say(`phase -> ${m.p}`);
+            else if (m.e === 'matchEnd') {
+              say(`match over: winner=${m.winner} (score ${m.score ? m.score.join('-') : '?'})`);
+              // Match finished — drop back to the lobby phase and re-ready so a
+              // rematch can start the moment the host returns to the lobby.
+              if (state.started) {
+                state.started = false;
+                state.round = 1;
+                state.status = state.paused ? 'paused' : 'connected';
+                emit({ t: 'status', id, status: state.status });
+                say('re-readying for rematch');
+                sendLobby();
+              }
+            }
             break;
           case 'away': say(`host ${m.on ? 'away' : 'back'}`); break;
           case 'bye': say('host left the room'); finish('host-left'); break;
