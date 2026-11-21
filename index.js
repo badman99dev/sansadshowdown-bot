@@ -3,7 +3,7 @@
 // Joins a friend's room by its 4-char code and plays with the game's own CPU
 // brain (hard profile) driven by live match snapshots, with lag prediction.
 //
-//   node index.js --code ABCD [--char modi] [--diff hard] [--name neta]
+//   node index.js --code ABCD [--char modi] [--diff hard|extreme|ultimate] [--name neta]
 
 const { startSession } = require('./session');
 
@@ -27,7 +27,7 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (args.help || !args.code) {
-  console.log(`Usage: node index.js --code <ROOM> [--char modi] [--diff hard|normal|easy] [--name neta] [--url https://fightkaro.com] [--duration secs]`);
+  console.log(`Usage: node index.js --code <ROOM> [--char modi] [--diff easy|normal|hard|extreme|ultimate] [--name neta] [--url https://fightkaro.com] [--duration secs]`);
   process.exit(args.help ? 0 : 1);
 }
 

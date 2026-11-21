@@ -4,36 +4,26 @@
 
 const { emptyInput, attackHeight, isHoldingBlock } = require('./proto');
 
-// base difficulty profiles, extracted from the game (i_).
+// Difficulty profiles. easy/normal/hard come straight from the game (i_);
+// extreme/ultimate are crafted on top of hard (snappier reaction + better
+// defence/aggression). `reaction` is the decision interval in seconds.
 const PROFILES = {
   easy: { breakChance: 0.08, reaction: 0.42, blockChance: 0.18, punishChance: 0.2, aggression: 0.45, superChance: 0.35, bossRead: 0.2 },
   normal: { breakChance: 0.3, reaction: 0.26, blockChance: 0.45, punishChance: 0.5, aggression: 0.65, superChance: 0.7, bossRead: 0.35 },
   hard: { breakChance: 0.6, reaction: 0.14, blockChance: 0.75, punishChance: 0.85, aggression: 0.8, superChance: 1, bossRead: 0.8, bossReaction: 0.06 },
+  extreme: { breakChance: 0.85, reaction: 0.08, blockChance: 0.92, punishChance: 0.96, aggression: 0.92, superChance: 1, bossRead: 0.95, bossReaction: 0.03 },
+  ultimate: { breakChance: 1, reaction: 0.05, blockChance: 1, punishChance: 1, aggression: 1, superChance: 1, bossRead: 1, bossReaction: 0.02 },
 };
 
-const LEVELS = ['easy', 'normal', 'hard'];
+const LEVELS = ['easy', 'normal', 'hard', 'extreme', 'ultimate'];
 // the game's default CPU level (ob = `normal`)
 const DEFAULT_LEVEL = 'normal';
 
-// Per-character CPU tuning baked into the game roster (ki[..].ai + power stats).
-// The playable online fighters have no overrides and use the base profile above.
-const CHAR_AI = {
-  putin: { minDifficulty: 'normal', hp: 1.15, power: 1.05, attackSpeed: 1.15 },
-  kim_jong_un: { minDifficulty: 'easy', hp: 1, power: 1, attackSpeed: 1 },
-  melodi: { minDifficulty: 'easy', hp: 1.1, power: 1.05, attackSpeed: 1.1, overrides: { aggression: 0.85 } },
-  hitler: { minDifficulty: 'hard', hp: 1.3, power: 1.15, attackSpeed: 1.6, overrides: { aggression: 1, reaction: 0.08, blockChance: 0.82, punishChance: 0.92 } },
-  queen_elizabeth: { minDifficulty: 'hard', hp: 1.3, power: 1.1, attackSpeed: 1.35, overrides: { aggression: 0.95, reaction: 0.1, blockChance: 0.8, punishChance: 0.9 } },
-};
-
-// Build the effective profile: base level <- per-char defaults <- explicit overrides.
-function resolveProfile(level, charId, overrides) {
+// All characters share this one brain. Behaviour is decided only by the chosen
+// level plus any explicit `overrides` — there are no per-character differences.
+function resolveProfile(level, overrides) {
   const base = PROFILES[level] || PROFILES[DEFAULT_LEVEL];
-  const charDef = charId && CHAR_AI[charId];
-  return {
-    ...base,
-    ...(charDef && charDef.overrides ? charDef.overrides : {}),
-    ...(overrides || {}),
-  };
+  return { ...base, ...(overrides || {}) };
 }
 
 class Bot {
@@ -42,7 +32,7 @@ class Bot {
     this.level = PROFILES[level] ? level : 'hard';
     this.overrides = overrides || {};
     this.charId = null;
-    this.profile = resolveProfile(this.level, this.charId, this.overrides);
+    this.profile = resolveProfile(this.level, this.overrides);
     this.plan = { kind: 'wait', time: 0, buttons: [] };
     this.elapsed = 0;
     this.sinceDecision = 99;
@@ -54,13 +44,14 @@ class Bot {
   setLevel(level, overrides) {
     if (level && PROFILES[level]) this.level = level;
     if (overrides !== undefined) this.overrides = overrides || {};
-    this.profile = resolveProfile(this.level, this.charId, this.overrides);
+    this.profile = resolveProfile(this.level, this.overrides);
     return this.level;
   }
 
+  // records which fighter we picked; does not change the brain
   setChar(charId) {
     this.charId = charId || null;
-    this.profile = resolveProfile(this.level, this.charId, this.overrides);
+    return this.charId;
   }
 
   think(me, opp, dt) {
@@ -111,19 +102,13 @@ class Bot {
   decide(me, opp) {
     this.sinceDecision = 0;
     const rng = this.rng;
-    const prof = me.char.id === 'mbapu'
-      ? { ...this.profile, aggression: 0.9, blockChance: 0.72, punishChance: 0.95, breakChance: 0.9, superChance: 0.9 }
-      : this.profile;
+    const prof = this.profile;
     const dist = Math.abs(opp.x - me.x);
 
     if (this.plan.kind === 'attack' && this.elapsed < this.plan.time && me.state === 'attack') return;
 
     if (me.meter >= 100 && opp.state !== 'knockdown' && opp.state !== 'getup' && !isHoldingBlock(opp) && rng() < prof.superChance) {
       this.setPlan('super', 0.1);
-      return;
-    }
-    if (me.char.id === 'mbapu' && dist < 1.9 && rng() < 0.75) {
-      this.planMbapuAttack(dist);
       return;
     }
     const phase = opp.attackPhase;
@@ -145,7 +130,7 @@ class Bot {
       if (dist < 1.5 && rng() < prof.punishChance) { this.setPlan('attack', 0.35, [{ at: 0, button: 'punch' }]); return; }
     }
     if (dist < 1.7 && (phase === 'recovery' || opp.state === 'getup') && rng() < prof.punishChance) {
-      me.isBoss ? this.planMbapuAttack(dist) : this.planAttack(dist);
+      this.planAttack(dist);
       return;
     }
     if (dist > 1.4) {
@@ -159,19 +144,6 @@ class Bot {
     else if (o < prof.aggression + 0.15) this.setPlan('retreat', 0.25 + rng() * 0.3);
     else if (o < prof.aggression + 0.25) this.setPlan('block', 0.3);
     else this.setPlan('wait', 0.2);
-  }
-
-  planMbapuAttack(dist) {
-    const t = this.rng();
-    if (dist > 1.15) {
-      if (t < 0.4) this.setPlan('attack', 0.65, [{ at: 0, button: 'punch', forward: true }]);
-      else if (t < 0.75) this.setPlan('attack', 0.65, [{ at: 0, button: 'kick', forward: true }]);
-      else this.setPlan('jumpIn', 0.85, [{ at: 0.25, button: 'kick' }]);
-    } else if (t < 0.3) this.setPlan('attack', 0.8, [{ at: 0, button: 'punch' }, { at: 0.18, button: 'punch' }, { at: 0.38, button: 'punch' }]);
-    else if (t < 0.55) this.setPlan('attack', 0.8, [{ at: 0, button: 'kick' }, { at: 0.28, button: 'kick' }]);
-    else if (t < 0.75) this.setPlan('attack', 0.65, [{ at: 0, button: 'kick', down: true }]);
-    else if (t < 0.9) this.setPlan('attack', 0.75, [{ at: 0, button: 'punch', forward: true }, { at: 0.32, button: 'kick' }]);
-    else this.setPlan('attack', 0.6, [{ at: 0, button: 'grab' }]);
   }
 
   planAttack(dist) {
@@ -219,4 +191,4 @@ class Bot {
   }
 }
 
-module.exports = { Bot, PROFILES, LEVELS, DEFAULT_LEVEL, CHAR_AI, resolveProfile };
+module.exports = { Bot, PROFILES, LEVELS, DEFAULT_LEVEL, resolveProfile };

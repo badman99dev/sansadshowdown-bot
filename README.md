@@ -60,7 +60,7 @@ node index.js --code ABCD --char modi --diff hard --name neta
 |---|---|---|
 | `--code` / `-c` | — | **required** 4-char room code |
 | `--char` | `modi` | fighter to pick |
-| `--diff` / `-d` | `hard` | `hard` \| `normal` \| `easy` |
+| `--diff` / `-d` | `hard` | `easy` \| `normal` \| `hard` \| `extreme` \| `ultimate` |
 | `--name` | `neta` | tag shown in the lobby |
 | `--url` | `https://fightkaro.com` | base URL |
 | `--duration` | `0` | stop after N seconds (0 = until the match/room ends) |
@@ -119,16 +119,25 @@ On connect the server pushes a `welcome` (catalog + current sessions). Then:
 
 ### Difficulty levels
 
-The bot uses the game's **own** CPU levels, extracted from the bundle:
+**Every character uses the same brain** — behaviour depends only on the level
+(and optional custom tuning), never on who you picked. `easy`/`normal`/`hard` are
+the game's own profiles (`i_` in the bundle); `extreme` and `ultimate` are crafted
+on top of `hard`.
 
-* `easy` / `normal` / `hard` — base profiles (`PROFILES` in `ai.js`); the game's
-  default is `normal`.
-* Per-character defaults (`CHAR_AI` in `ai.js`) — the story bosses
-  (`putin`, `melodi`, `hitler`, `kim_jong_un`, `queen_elizabeth`) carry their own
-  `aggression` / `reaction` / `blockChance` / `punishChance` overrides, applied
-  automatically when that fighter is picked.
+| level | reaction | block | punish | break | aggression | super |
+|---|---|---|---|---|---|---|
+| `easy` | 0.42s | 18% | 20% | 8% | 45% | 35% |
+| `normal` *(game default)* | 0.26s | 45% | 50% | 30% | 65% | 70% |
+| `hard` | 0.14s | 75% | 85% | 60% | 80% | 100% |
+| `extreme` | 0.08s | 92% | 96% | 85% | 92% | 100% |
+| `ultimate` | 0.05s | 100% | 100% | 100% | 100% | 100% |
+
+* `reaction` is the decision interval — smaller is snappier.
 * Optional `overrides: { aggression, reaction, blockChance, punishChance, breakChance, superChance, bossRead }`
-  on top, for a fully custom level.
+  layer on top of any level for fully custom behaviour.
+
+> Latency caps real skill: at ~140 ms RTT the bot can't react frame-perfect even at
+> `ultimate`. Run it close to the host (Singapore for India) for the best result.
 
 ### Example client
 

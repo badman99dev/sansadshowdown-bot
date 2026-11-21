@@ -16,7 +16,7 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { startSession, LEVELS } = require('./session');
-const { PROFILES, CHAR_AI } = require('./ai');
+const { PROFILES } = require('./ai');
 const proto = require('./proto');
 
 const sessions = new Map();
@@ -101,7 +101,7 @@ function handleControl(ws, m) {
   switch (m.t) {
     case 'hello':
     case 'list':
-      sendTo(ws, { t: 'hello', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS, charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS });
+      sendTo(ws, { t: 'hello', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS });
       break;
     case 'join':
       if (!m.code) return sendTo(ws, { t: 'error', message: 'missing code' });
@@ -195,13 +195,13 @@ const PAGE = (base) => `<!doctype html><html><head><meta charset="utf-8"/>
   <div class="row">
     <input id="code" maxlength="4" placeholder="CODE" autocomplete="off"/>
     <select id="char">${CHARS.map((c) => `<option${c === 'modi' ? ' selected' : ''}>${c}</option>`).join('')}</select>
-    <select id="diff"><option>easy</option><option>normal</option><option selected>hard</option></select>
+    <select id="diff"><option>hard</option></select>
     <input id="dur" class="mini" type="number" placeholder="secs" value="0"/>
     <input id="hz" class="mini" type="number" placeholder="hz" value="60"/>
     <button onclick="join()">JOIN ROOM</button>
   </div>
   <details>
-    <summary>custom CPU tuning (optional, leave blank for the character's default level)</summary>
+    <summary>custom CPU tuning (optional — leave blank to use the level's defaults)</summary>
     <div class="adv">${OVERRIDE_KEYS.map((k) => `<div><label>${k}</label><input id="ov_${k}" class="mini" type="number" step="0.01" placeholder="—"/></div>`).join('')}</div>
   </details>
   <div id="msg" class="sub" style="margin:10px 0 0"></div>
@@ -218,7 +218,7 @@ const PAGE = (base) => `<!doctype html><html><head><meta charset="utf-8"/>
 </div>
 
 <script>
-let ws=null, retry=0, MAX=8;
+let ws=null, retry=0, MAX=8, LEVELS_LIST=['easy','normal','hard'];
 function connect(){
   const proto2 = location.protocol==='https:'?'wss':'ws';
   ws = new WebSocket(proto2+'://'+location.host+'/ws');
@@ -232,7 +232,7 @@ function send(o){ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); else m
 function msg(t,cls){ const m=document.getElementById('msg'); m.innerHTML = cls?'<span class="'+cls+'">'+t+'</span>':t; }
 
 function onMsg(m){
-  if(m.t==='welcome'||m.t==='hello'||m.t==='sessions'){ if(m.max) MAX=m.max; if(m.sessions){ render(m.sessions); capacity(m.sessions); } }
+  if(m.t==='welcome'||m.t==='hello'||m.t==='sessions'){ if(m.max) MAX=m.max; if(m.levels){ LEVELS_LIST=m.levels; fillLevelSelect(); } if(m.sessions){ render(m.sessions); capacity(m.sessions); } }
   else if(m.t==='joined'){ msg('session <code>'+m.id+'</code> started'); }
   else if(m.t==='log'){ const el=document.getElementById('logs'); if(el.textContent==='–')el.textContent=''; el.textContent+=m.line+'\\n'; el.scrollTop=el.scrollHeight; }
   else if(m.t==='error'){ msg(m.message||'error','bad'); }
@@ -262,7 +262,7 @@ function render(rows){
     h+='<tr>'
       +'<td><code>'+s.id+'</code></td><td>'+s.code+'</td><td>'+(s.char||'?')+'</td><td>'+(s.opp||'?')+'</td>'
       +'<td class="'+st+'">'+s.status+(s.error?' ('+s.error+')':'')+'</td>'
-      +'<td>'+(s.ended?escapeHtml(s.level||''):'<select onchange="setLevel(\\''+s.id+'\\',this)">'+['easy','normal','hard'].map(l=>'<option'+(l===s.level?' selected':'')+'>'+l+'</option>').join('')+'</select>')+'</td>'
+      +'<td>'+(s.ended?escapeHtml(s.level||''):'<select onchange="setLevel(\\''+s.id+'\\',this)">'+LEVELS_LIST.map(l=>'<option'+(l===s.level?' selected':'')+'>'+l+'</option>').join('')+'</select>')+'</td>'
       +'<td>'+s.ourHp+' vs '+s.oppHp+'</td><td>'+s.timer+'</td><td>'+pps+'</td><td>'+(s.rtt??'-')+'ms</td>'
       +'<td>'+(s.ended?'<span class="muted">ended</span>':'<button class="sm" onclick="pause(\\''+s.id+'\\')">'+(s.paused?'▶ resume':'⏸ pause')+'</button> <button class="sm warn" onclick="stop(\\''+s.id+'\\')">stop</button>')+'</td>'
       +'</tr>';
@@ -274,6 +274,13 @@ function capacity(rows){
   const live=rows.filter(r=>!r.ended).length;
   document.getElementById('cap').textContent=' '+live+'/'+MAX+' rooms';
 }
+function fillLevelSelect(){
+  const sel=document.getElementById('diff');
+  if(!sel) return;
+  const cur=sel.value||'hard';
+  sel.innerHTML=LEVELS_LIST.map(l=>'<option'+(l===cur?' selected':'')+'>'+l+'</option>').join('');
+}
+fillLevelSelect();
 connect();
 </script></body></html>`;
 
@@ -333,7 +340,7 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   sendTo(ws, {
     t: 'welcome', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS,
-    charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS,
+    levels: LEVELS, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS,
   });
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
