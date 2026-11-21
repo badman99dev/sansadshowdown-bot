@@ -6,6 +6,9 @@ It joins a friend's room by its **4-character code** and plays the match using t
 game's *own* CPU brain (the same AI that drives the in-game bot, `hard` profile),
 driven by live match snapshots received over WebRTC.
 
+It can also **host**: create a room and share a link, running the fight simulation
+itself (the game's host is authoritative) while the CPU brain bots the host fighter.
+
 No browser. Pure Node.js. Speaks the game's real WebRTC + DataChannel protocol
 (`werift` for WebRTC, plain `ws` for signaling probes).
 
@@ -76,12 +79,32 @@ npm start           # listens on $PORT (default 8080)
 
 | route | description |
 |---|---|
-| `GET /` | dashboard: enter a code, hit **JOIN ROOM**, then pause/resume/change level live over the WebSocket |
+| `GET /` | dashboard: **JOIN ROOM** (bot joins a friend) or **CREATE ROOM** (bot hosts), then pause/resume/change level live over the WebSocket |
 | `GET /join?code=ABCD&char=modi&diff=hard&duration=0` | start a session, returns `{ id }` |
 | `GET /sessions` | JSON list of all sessions with live status |
 | `GET /logs?id=<sid>` | plain-text log for a session |
 | `GET /stop?id=<sid>` | stop a session |
 | `GET /health` | health probe — `{ ok, sessions, active, max, clients }` |
+
+### Bot as host (create a room)
+
+Hit **CREATE ROOM** on the dashboard and the bot creates a room, then shows the
+code and a share link:
+
+```
+room code   H4MW
+share link  https://fightkaro.com/?room=H4MW
+```
+
+Your friend opens the link (or types the code) at fightkaro.com and joins. The bot
+is the **host**, so it runs the authoritative fight simulation (`sim.js`, a
+headless port of the game's simulation) and serves snapshots; the CPU brain bots
+fighter 0 while the friend's raw inputs drive fighter 1. After the match the bot
+returns to the lobby and can **rematch** immediately.
+
+> Requires a room that is actually joinable. The bot publishes its WebRTC offer as
+> soon as ICE candidates exist (sub-second) rather than waiting for werift's
+> gather to report "complete" — which costs 13-25 s against the game's TURN servers.
 
 ---
 
@@ -97,7 +120,8 @@ On connect the server pushes a `welcome` (catalog + current sessions). Then:
 
 | message | effect |
 |---|---|
-| `{t:'join', code, char?, diff?, name?, duration?, hz?, predict?, overrides?}` | join a room and start playing |
+| `{t:'join', code, char?, diff?, name?, duration?, hz?, predict?, overrides?}` | join a friend's room and start playing |
+| `{t:'create', char?, diff?, name?, duration?, hz?, overrides?}` | **create** a room (bot hosts) → returns a code + share link |
 | `{t:'pause', id}` / `{t:'resume', id}` / `{t:'toggle', id}` | pause / resume (fighter goes idle) |
 | `{t:'level', id, diff?, overrides?}` | change difficulty **mid-match** |
 | `{t:'char', id, char}` | change fighter (before start it re-sends the lobby) |
@@ -109,8 +133,10 @@ On connect the server pushes a `welcome` (catalog + current sessions). Then:
 
 | message | meaning |
 |---|---|
-| `{t:'welcome'}` / `{t:'hello'}` | catalog: `levels`, `profiles`, `chars`, `charAi`, `overrideKeys`, `sessions` |
-| `{t:'joined', id, code, status}` | session created |
+| `{t:'welcome'}` / `{t:'hello'}` | catalog: `levels`, `profiles`, `chars`, `overrideKeys`, `sessions` |
+| `{t:'joined', id, code?, role?, status}` | session created (`role:'host'` for a created room) |
+| `{t:'created', id, code, share}` | host room created — `share` is `https://fightkaro.com/?room=CODE` |
+| `{t:'joinable', id, code, share}` | the host's offer is published; the room can now be joined |
 | `{t:'ok', id, action, ...}` | command applied |
 | `{t:'error', message, id?}` | command rejected |
 | `{t:'sessions', sessions:[…]}` | live state, pushed every second |
@@ -221,6 +247,21 @@ node selftest.js modi rahul          # runs host + bot together
 FK_HOST_ONLY=1 node selftest.js      # prints a room code and waits
 ```
 
+`hosttest.js` exercises the **bot-as-host** path end to end: it creates a room via
+the real signaling server, joins it with a guest bot, and fights (verifying the
+headless simulation, snapshots and rematch):
+
+```bash
+npm run hosttest              # DUR=30 npm run hosttest  (seconds)
+```
+
+`servertest.js` boots the whole service and drives it through the `/ws` control
+socket the way the dashboard does (`create` → `join` → fight):
+
+```bash
+npm run servertest            # DUR=45 npm run servertest
+```
+
 ---
 
 ## Latency
@@ -239,11 +280,15 @@ are behind NAT. Distance dominates the round-trip: a US host vs an India host is
 | `proto.js` | wire codecs (input bitmask, input packet, snapshot→fighter) |
 | `ai.js` | CPU brain ported 1:1 from the game bundle + difficulty profiles |
 | `moves.json` | move catalog extracted from the game |
-| `net.js` | WebRTC guest client + signaling + ping/pong |
-| `session.js` | one bot session (join → lobby → start → 60 Hz loop) |
+| `net.js` | WebRTC client + signaling: guest (`joinRoom`) and host (`createRoom`) |
+| `session.js` | one **guest** bot session (join → lobby → start → 60 Hz loop) |
+| `host.js` | one **host** bot session (create room → simulate → snapshots) |
+| `sim.js` | headless port of the game's fight simulation (host-authoritative) |
 | `index.js` | CLI entry point |
 | `server.js` | HTTP service + WebSocket control channel + dashboard (Render entry) |
 | `selftest.js` | fake-host harness for end-to-end testing |
+| `hosttest.js` | bot-as-host end-to-end test (create → guest joins → fight) |
+| `servertest.js` | full-service test driven through the `/ws` control socket |
 | `controltest.js` | WebSocket control-channel test client |
 
 MIT licensed. For educational / personal use.

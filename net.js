@@ -4,8 +4,15 @@
 // werift's RTCPeerConnection.
 
 const { RTCPeerConnection } = require('werift');
+const WebSocket = require('ws');
 
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+// werift's default gathering wait is 5s (STUN) + 8s (TURN) → setLocalDescription
+// took ~13-25s against the game's servers before it resolved, delaying the whole
+// handshake. Every candidate actually arrives in <1s, so cap the waits: enough
+// time for the TURN allocations we need, none for the long tail.
+const ICE_TUNING = { iceStunGatherTimeout: 1, iceTurnConnectTimeout: 3 };
 
 function normalizeCode(raw) {
   if (typeof raw !== 'string') return null;
@@ -143,7 +150,7 @@ async function joinRoom({ baseUrl, code, iceUrl, log = () => {} }) {
   log(`ICE: ${iceServers.length} server(s)${ice && ice.relay ? ' (with TURN relay)' : ' (STUN only)'}`);
   log(`host offer: ${pct(offer.sdp)}`);
 
-  const pc = new RTCPeerConnection({ iceServers });
+  const pc = new RTCPeerConnection({ iceServers, ...ICE_TUNING });
   pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
   pc.oniceconnectionstatechange = () => log(`ice: ${pc.iceConnectionState}`);
 
@@ -152,12 +159,20 @@ async function joinRoom({ baseUrl, code, iceUrl, log = () => {} }) {
 
   await pc.setRemoteDescription({ type: offer.type || 'offer', sdp: offer.sdp });
   const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
 
-  // wait for ICE gathering to settle so the answer carries our candidates
-  const t0 = Date.now();
-  while (pc.iceGatheringState !== 'complete' && Date.now() - t0 < 6000) await sleep(100);
-  const local = pc.localDescription;
+  // Same trick as the host side: send the answer as soon as candidates exist
+  // instead of waiting for werift's gather "complete" (ICE_TUNING caps it).
+  const cands = [];
+  pc.onicecandidate = (e) => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); };
+  pc.setLocalDescription(answer).catch(() => {}); // deliberate: not awaited
+
+  let lastCount = -1, quiet = 0;
+  for (let i = 0; i < 60; i++) { // min 300ms, max 3s
+    if (cands.length !== lastCount) { lastCount = cands.length; quiet = 0; } else quiet++;
+    if (cands.length > 0 && quiet >= 6 && i >= 6) break;
+    await sleep(50);
+  }
+  const local = { type: 'answer', sdp: answer.sdp.trimEnd() + '\r\n' + cands.map((c) => 'a=' + c).join('\r\n') + '\r\n' };
   log(`our answer: ${pct(local.sdp)}`);
 
   const room = new Room(pc, ctrl, input, { log });
@@ -181,4 +196,84 @@ async function joinRoom({ baseUrl, code, iceUrl, log = () => {} }) {
   return room;
 }
 
-module.exports = { joinRoom, normalizeCode, Room };
+// --- host side: create a room and wait for a guest --------------------------
+// Mirrors the game's host role: open the signaling socket, receive {code,secret,
+// ice}, publish a fresh offer, take the guest's answer, then open the channels.
+async function createRoom({ baseUrl, log = () => {}, onRoom = () => {}, onOffer = () => {} }) {
+  const wsUrl = baseUrl.replace(/^http/, 'ws') + '/api/room/ws';
+  log(`creating room via ${wsUrl} ...`);
+
+  const sig = await new Promise((resolve, reject) => {
+    const w = new WebSocket(wsUrl);
+    const timer = setTimeout(() => reject(new Error('signaling timeout')), 15000);
+    w.on('message', (d) => {
+      let m; try { m = JSON.parse(d.toString()); } catch { return; }
+      if (m.t === 'room') { clearTimeout(timer); resolve({ w, ...m }); }
+    });
+    w.on('error', (e) => { clearTimeout(timer); reject(e); });
+    w.on('close', () => { clearTimeout(timer); reject(new Error('signaling closed before room created')); });
+  });
+
+  const code = sig.code;
+  log(`room created: ${code}`);
+  onRoom({ code, secret: sig.secret });
+  const iceServers = (sig.ice && sig.ice.iceServers) || [{ urls: 'stun:stun.l.google.com:19302' }];
+  log(`ICE: ${iceServers.length} server(s)${sig.ice && sig.ice.relay ? ' (with TURN relay)' : ' (STUN only)'}`);
+
+  const pc = new RTCPeerConnection({ iceServers, ...ICE_TUNING });
+  pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
+  pc.oniceconnectionstatechange = () => log(`ice: ${pc.iceConnectionState}`);
+
+  const ctrl = pc.createDataChannel('ctrl', { negotiated: true, id: 0, ordered: true });
+  const input = pc.createDataChannel('input', { negotiated: true, id: 1, ordered: false, maxRetransmits: 0 });
+
+  // Publish the offer as soon as candidates exist rather than waiting for
+  // werift's gather to report "complete" (ICE_TUNING caps that wait, but this
+  // still gets a joinable room out in well under a second). Collect candidates
+  // from onicecandidate and append them to the base SDP ourselves — the base
+  // has one m-line and no candidate lines, so appending is safe.
+  const cands = [];
+  pc.onicecandidate = (e) => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); };
+
+  const offer = await pc.createOffer();
+  pc.setLocalDescription(offer).catch(() => {}); // deliberate: not awaited
+
+  let lastCount = -1, quiet = 0;
+  for (let i = 0; i < 60; i++) { // min 300ms, max 3s
+    if (cands.length !== lastCount) { lastCount = cands.length; quiet = 0; } else quiet++;
+    if (cands.length > 0 && quiet >= 6 && i >= 6) break;
+    await sleep(50);
+  }
+  const sdp = offer.sdp.trimEnd() + '\r\n' + cands.map((c) => 'a=' + c).join('\r\n') + '\r\n';
+  sig.w.send(JSON.stringify({ t: 'offer', desc: { type: 'offer', sdp } }));
+  log(`offer published in ${cands.length} candidates (${pct(sdp)}); waiting for a guest...`);
+  onOffer({ code });
+
+  const answer = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('no guest joined (offer timeout)')), 30 * 60 * 1000);
+    sig.w.on('message', (d) => {
+      let m; try { m = JSON.parse(d.toString()); } catch { return; }
+      if (m.t === 'answer') { clearTimeout(timer); resolve(m.desc); }
+      if (m.t === 'close') { clearTimeout(timer); reject(new Error('signaling closed before a guest joined')); }
+    });
+  });
+  log('answer received from signaling');
+  const tsr = Date.now();
+  await pc.setRemoteDescription({ type: answer.type || 'answer', sdp: answer.sdp });
+  sig.w.send(JSON.stringify({ t: 'sid', sid: sig.secret }));
+  log(`guest answered; completing handshake (remote desc ${Date.now() - tsr}ms)`);
+
+  const room = new Room(pc, ctrl, input, { log });
+  room.signaling = sig.w;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Could not connect to guest (relay/TURN may be required)')), 45000);
+    const check = () => { if (ctrl.readyState === 'open' && input.readyState === 'open') { clearTimeout(timer); resolve(); } };
+    ctrl.onopen = () => { log('ctrl open'); check(); };
+    input.onopen = () => { log('input open'); check(); };
+    check();
+  });
+  log('guest connected ✓');
+  return { room, code };
+}
+
+module.exports = { joinRoom, createRoom, normalizeCode, Room };

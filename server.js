@@ -16,6 +16,7 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { startSession, LEVELS } = require('./session');
+const { startHostSession } = require('./host');
 const { PROFILES } = require('./ai');
 const proto = require('./proto');
 
@@ -47,6 +48,20 @@ function broadcast(obj) { const s = JSON.stringify(obj); for (const ws of client
 // which controller owns each session (null = created over HTTP, open to anyone)
 const owner = new Map();
 
+// route a session's events: private ones (logs, created, joinable) go to its
+// controller only; status/over/list go to everyone
+function route(s) {
+  s.subscribe((ev) => {
+    if (ev.t === 'log' || ev.t === 'created' || ev.t === 'joinable') {
+      const o = owner.get(s.id);
+      if (o && o.readyState === 1) sendTo(o, ev); else broadcast(ev);
+    } else {
+      if (ev.t === 'over') owner.delete(s.id);
+      broadcast(ev);
+    }
+  });
+}
+
 function createSession(ws, p) {
   gc();
   const active = [...sessions.values()].filter((s) => !s.state.ended).length;
@@ -70,16 +85,34 @@ function createSession(ws, p) {
   const isWs = ws && ws.readyState === 1;
   owner.set(s.id, isWs ? ws : null);
   // route each session's log lines to its own controller; status goes to everyone
-  s.subscribe((ev) => {
-    if (ev.t === 'log') {
-      const o = owner.get(s.id);
-      if (o && o.readyState === 1) sendTo(o, ev); else broadcast(ev);
-    } else {
-      if (ev.t === 'over') owner.delete(s.id);
-      broadcast(ev);
-    }
-  });
+  route(s);
   sendTo(ws, { t: 'joined', id: s.id, code: s.status().code, status: s.status().status });
+  broadcast({ t: 'sessions', sessions: listSessions(), max: MAX_SESSIONS });
+  return s;
+}
+
+// create a room as HOST: the bot runs the simulation and bots fighter 0.
+function createHost(ws, p) {
+  gc();
+  const active = [...sessions.values()].filter((s) => !s.state.ended).length;
+  if (active >= MAX_SESSIONS) {
+    sendTo(ws, { t: 'error', message: `server full — ${MAX_SESSIONS} rooms max, try again later` });
+    return null;
+  }
+  const overrides = p.overrides && typeof p.overrides === 'object' ? pickOverrides(p.overrides) : undefined;
+  const s = startHostSession({
+    char: p.char || 'modi',
+    diff: p.diff || 'hard',
+    name: p.name || 'neta',
+    duration: Number(p.duration) || 0,
+    hz: Number(p.hz) || 60,
+  });
+  s.setLevel(s.state.level, overrides);
+  sessions.set(s.id, s);
+  const isWs = ws && ws.readyState === 1;
+  owner.set(s.id, isWs ? ws : null);
+  route(s);
+  sendTo(ws, { t: 'joined', id: s.id, role: 'host', status: s.status().status });
   broadcast({ t: 'sessions', sessions: listSessions(), max: MAX_SESSIONS });
   return s;
 }
@@ -106,6 +139,9 @@ function handleControl(ws, m) {
     case 'join':
       if (!m.code) return sendTo(ws, { t: 'error', message: 'missing code' });
       createSession(ws, m);
+      break;
+    case 'create':
+      createHost(ws, m);
       break;
     case 'pause': case 'resume': case 'toggle': {
       const s = sessions.get(m.id);
@@ -208,6 +244,26 @@ const PAGE = (base) => `<!doctype html><html><head><meta charset="utf-8"/>
 </div>
 
 <div class="card">
+  <div class="row" style="justify-content:space-between"><b>Create a room (bot hosts)</b><span class="muted">your friend joins with the link</span></div>
+  <div class="row" style="margin-top:10px">
+    <select id="hchar">${CHARS.map((c) => `<option${c === 'modi' ? ' selected' : ''}>${c}</option>`).join('')}</select>
+    <select id="hdiff"><option>hard</option></select>
+    <button onclick="createRoom()">➕ CREATE ROOM</button>
+  </div>
+  <div id="share" style="display:none;margin-top:12px">
+    <label>room code</label>
+    <div class="row"><input id="sharecode" readonly style="width:120px;font-size:20px;letter-spacing:4px;text-align:center"/></div>
+    <label style="margin-top:10px">share link — send this to your friend</label>
+    <div class="row">
+      <input id="sharelink" readonly style="width:340px"/>
+      <button class="sm" onclick="copy('sharelink')">copy link</button>
+      <a id="openlink" target="_blank" rel="noopener"><button class="sm">open</button></a>
+    </div>
+  </div>
+  <div id="cmsg" class="sub" style="margin:10px 0 0"></div>
+</div>
+
+<div class="card">
   <div class="row" style="justify-content:space-between"><b>Sessions</b><span id="cap" class="muted"></span><button class="sm" onclick="send({t:'list'})">Refresh</button></div>
   <div id="list" class="sub" style="margin-top:10px">no sessions</div>
 </div>
@@ -233,11 +289,27 @@ function msg(t,cls){ const m=document.getElementById('msg'); m.innerHTML = cls?'
 
 function onMsg(m){
   if(m.t==='welcome'||m.t==='hello'||m.t==='sessions'){ if(m.max) MAX=m.max; if(m.levels){ LEVELS_LIST=m.levels; fillLevelSelect(); } if(m.sessions){ render(m.sessions); capacity(m.sessions); } }
-  else if(m.t==='joined'){ msg('session <code>'+m.id+'</code> started'); }
+  else if(m.t==='created'){ showShare(m.code, m.share); }
+  else if(m.t==='joinable'){ /* offer is live; link already shown */ }
+  else if(m.t==='joined'){ msg('session <code>'+m.id+'</code> started'+(m.role==='host'?' (host)':'')); }
   else if(m.t==='log'){ const el=document.getElementById('logs'); if(el.textContent==='–')el.textContent=''; el.textContent+=m.line+'\\n'; el.scrollTop=el.scrollHeight; }
   else if(m.t==='error'){ msg(m.message||'error','bad'); }
 }
 
+function createRoom(){
+  const t=document.getElementById('cmsg'); if(t) t.textContent='creating room...';
+  send({ t:'create', char:document.getElementById('hchar').value,
+    diff:document.getElementById('hdiff').value, hz:Number(document.getElementById('hz').value)||60 });
+}
+function copy(id){ const el=document.getElementById(id); try{el.select();}catch{} try{navigator.clipboard.writeText(el.value);}catch{} const t=document.getElementById('cmsg'); if(t){t.textContent='copied ✓'; setTimeout(()=>{t.textContent='';},1500);} }
+function copyText(s){ try{navigator.clipboard.writeText(s);}catch{} msg('copied: <code>'+s+'</code>'); }
+function showShare(code, link){
+  const box=document.getElementById('share'); if(box) box.style.display='block';
+  const c=document.getElementById('sharecode'); if(c) c.value=code;
+  const l=document.getElementById('sharelink'); if(l) l.value=link;
+  const o=document.getElementById('openlink'); if(o) o.href=link;
+  const t=document.getElementById('cmsg'); if(t) t.innerHTML='room <b>'+code+'</b> ready — send the link to your friend';
+}
 function join(){
   const ov={};
   for(const k of ${JSON.stringify(OVERRIDE_KEYS)}){ const v=document.getElementById('ov_'+k).value; if(v!=='') ov[k]=Number(v); }
@@ -260,11 +332,11 @@ function render(rows){
     const pps = s.ageSec>0 ? (s.packets/Math.max(1,s.ageSec)).toFixed(0) : '-';
     const st = s.ended?'muted':(s.status==='fighting'?'ok':(s.status==='paused'?'warnc':''));
     h+='<tr>'
-      +'<td><code>'+s.id+'</code></td><td>'+s.code+'</td><td>'+(s.char||'?')+'</td><td>'+(s.opp||'?')+'</td>'
+      +'<td><code>'+s.id+'</code></td><td>'+s.code+' '+(s.role==='host'?'<span class="muted">HOST</span>':'')+'</td><td>'+(s.char||'?')+'</td><td>'+(s.opp||'?')+'</td>'
       +'<td class="'+st+'">'+s.status+(s.error?' ('+s.error+')':'')+'</td>'
       +'<td>'+(s.ended?escapeHtml(s.level||''):'<select onchange="setLevel(\\''+s.id+'\\',this)">'+LEVELS_LIST.map(l=>'<option'+(l===s.level?' selected':'')+'>'+l+'</option>').join('')+'</select>')+'</td>'
       +'<td>'+s.ourHp+' vs '+s.oppHp+'</td><td>'+s.timer+'</td><td>'+pps+'</td><td>'+(s.rtt??'-')+'ms</td>'
-      +'<td>'+(s.ended?'<span class="muted">ended</span>':'<button class="sm" onclick="pause(\\''+s.id+'\\')">'+(s.paused?'▶ resume':'⏸ pause')+'</button> <button class="sm warn" onclick="stop(\\''+s.id+'\\')">stop</button>')+'</td>'
+      +'<td>'+(s.ended?'<span class="muted">ended</span>':(s.role==='host'&&s.share?'<button class="sm" onclick="copyText(\\''+s.share+'\\')">link</button> ':'')+'<button class="sm" onclick="pause(\\''+s.id+'\\')">'+(s.paused?'▶ resume':'⏸ pause')+'</button> <button class="sm warn" onclick="stop(\\''+s.id+'\\')">stop</button>')+'</td>'
       +'</tr>';
   }
   el.innerHTML=h+'</table>';
@@ -275,10 +347,12 @@ function capacity(rows){
   document.getElementById('cap').textContent=' '+live+'/'+MAX+' rooms';
 }
 function fillLevelSelect(){
-  const sel=document.getElementById('diff');
-  if(!sel) return;
-  const cur=sel.value||'hard';
-  sel.innerHTML=LEVELS_LIST.map(l=>'<option'+(l===cur?' selected':'')+'>'+l+'</option>').join('');
+  for(const id of ['diff','hdiff']){
+    const sel=document.getElementById(id);
+    if(!sel) continue;
+    const cur=sel.value||'hard';
+    sel.innerHTML=LEVELS_LIST.map(l=>'<option'+(l===cur?' selected':'')+'>'+l+'</option>').join('');
+  }
 }
 fillLevelSelect();
 connect();
