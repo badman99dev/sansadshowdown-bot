@@ -4,21 +4,63 @@
 
 const { emptyInput, attackHeight, isHoldingBlock } = require('./proto');
 
+// base difficulty profiles, extracted from the game (i_).
 const PROFILES = {
   easy: { breakChance: 0.08, reaction: 0.42, blockChance: 0.18, punishChance: 0.2, aggression: 0.45, superChance: 0.35, bossRead: 0.2 },
   normal: { breakChance: 0.3, reaction: 0.26, blockChance: 0.45, punishChance: 0.5, aggression: 0.65, superChance: 0.7, bossRead: 0.35 },
   hard: { breakChance: 0.6, reaction: 0.14, blockChance: 0.75, punishChance: 0.85, aggression: 0.8, superChance: 1, bossRead: 0.8, bossReaction: 0.06 },
 };
 
+const LEVELS = ['easy', 'normal', 'hard'];
+// the game's default CPU level (ob = `normal`)
+const DEFAULT_LEVEL = 'normal';
+
+// Per-character CPU tuning baked into the game roster (ki[..].ai + power stats).
+// The playable online fighters have no overrides and use the base profile above.
+const CHAR_AI = {
+  putin: { minDifficulty: 'normal', hp: 1.15, power: 1.05, attackSpeed: 1.15 },
+  kim_jong_un: { minDifficulty: 'easy', hp: 1, power: 1, attackSpeed: 1 },
+  melodi: { minDifficulty: 'easy', hp: 1.1, power: 1.05, attackSpeed: 1.1, overrides: { aggression: 0.85 } },
+  hitler: { minDifficulty: 'hard', hp: 1.3, power: 1.15, attackSpeed: 1.6, overrides: { aggression: 1, reaction: 0.08, blockChance: 0.82, punishChance: 0.92 } },
+  queen_elizabeth: { minDifficulty: 'hard', hp: 1.3, power: 1.1, attackSpeed: 1.35, overrides: { aggression: 0.95, reaction: 0.1, blockChance: 0.8, punishChance: 0.9 } },
+};
+
+// Build the effective profile: base level <- per-char defaults <- explicit overrides.
+function resolveProfile(level, charId, overrides) {
+  const base = PROFILES[level] || PROFILES[DEFAULT_LEVEL];
+  const charDef = charId && CHAR_AI[charId];
+  return {
+    ...base,
+    ...(charDef && charDef.overrides ? charDef.overrides : {}),
+    ...(overrides || {}),
+  };
+}
+
 class Bot {
   constructor(level = 'hard', rng = Math.random, overrides = {}) {
     this.rng = rng;
-    this.profile = { ...(PROFILES[level] || PROFILES.hard), ...overrides };
+    this.level = PROFILES[level] ? level : 'hard';
+    this.overrides = overrides || {};
+    this.charId = null;
+    this.profile = resolveProfile(this.level, this.charId, this.overrides);
     this.plan = { kind: 'wait', time: 0, buttons: [] };
     this.elapsed = 0;
     this.sinceDecision = 99;
     this.read = null;
     this.readIt = false;
+  }
+
+  // swap difficulty (and/or custom tuning) mid-match
+  setLevel(level, overrides) {
+    if (level && PROFILES[level]) this.level = level;
+    if (overrides !== undefined) this.overrides = overrides || {};
+    this.profile = resolveProfile(this.level, this.charId, this.overrides);
+    return this.level;
+  }
+
+  setChar(charId) {
+    this.charId = charId || null;
+    this.profile = resolveProfile(this.level, this.charId, this.overrides);
   }
 
   think(me, opp, dt) {
@@ -177,4 +219,4 @@ class Bot {
   }
 }
 
-module.exports = { Bot, PROFILES };
+module.exports = { Bot, PROFILES, LEVELS, DEFAULT_LEVEL, CHAR_AI, resolveProfile };

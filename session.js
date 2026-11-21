@@ -1,9 +1,12 @@
 'use strict';
 // A single bot session: joins a room by code and plays it with the CPU brain.
-// Shared by the CLI (index.js) and the HTTP service (server.js).
+// Shared by the CLI (index.js) and the control service (server.js).
+//
+// Live controls (used by the WebSocket controller):
+//   pause() / resume() / toggle() / setLevel(diff, overrides) / setChar(c) / setHz(n)
 
 const { joinRoom, normalizeCode } = require('./net');
-const { Bot } = require('./ai');
+const { Bot, LEVELS, DEFAULT_LEVEL } = require('./ai');
 const proto = require('./proto');
 
 let counter = 0;
@@ -19,27 +22,40 @@ function startSession(opts = {}) {
     url: (opts.url || 'https://fightkaro.com').replace(/\/$/, ''),
     duration: Number(opts.duration) || 0,
     predict: opts.predict !== false,
+    hz: Number(opts.hz) || 60,
   };
   const log = opts.log || (() => {});
+  const subs = new Set();
   const lines = [];
-  const say = (m) => { const l = `[${ts()}] ${m}`; lines.push(l); if (lines.length > 200) lines.shift(); log(l); };
 
   const state = {
     id, cfg, status: 'connecting', error: null,
     ourPick: cfg.char, ourChar: cfg.char, oppChar: null, hostPick: null,
-    started: false, snap: null, timer: null, ourHp: 100, oppHp: 100,
+    started: false, paused: false, snap: null, timer: null, ourHp: 100, oppHp: 100,
     round: 1, packets: 0, rtt: null, ended: false, at: Date.now(), lines,
+    level: cfg.diff, char: cfg.char, hz: cfg.hz,
   };
+
+  const say = (m) => {
+    const l = `[${ts()}] ${m}`;
+    lines.push(l); if (lines.length > 300) lines.shift();
+    log(l);
+    emit({ t: 'log', id, line: l });
+  };
+  function emit(ev) { for (const fn of subs) { try { fn(ev); } catch {} } }
+
   const bot = new Bot(cfg.diff, Math.random, {});
-  let room = null, sendTimer = null, loop = null, statusTimer = null;
+  bot.setChar(cfg.char);
+  let room = null, sendTimer = null, loop = null, statusTimer = null, durationTimer = null;
 
   function finish(status) {
     if (state.ended) return;
     state.ended = true;
     state.status = status || 'ended';
-    clearInterval(sendTimer); clearInterval(loop); clearInterval(statusTimer);
+    clearInterval(sendTimer); clearInterval(loop); clearInterval(statusTimer); clearTimeout(durationTimer);
     try { room && room.close(); } catch {}
     say(`session ${id} ended (${state.status})`);
+    emit({ t: 'over', id, status: state.status });
   }
 
   function sendLobby() {
@@ -50,6 +66,39 @@ function startSession(opts = {}) {
     say(`lobby sent (pick=${state.ourPick}, ready=true)`);
   }
 
+  // --- 60 Hz decision loop (restartable so the rate can change live) ---
+  const recent = [];
+  let seq = 0;
+  const DT = 1 / 60;
+  function tick() {
+    if (!room || state.ended) return;
+    // paused: feed neutral frames so the fighter idles and the host stays alive
+    if (state.paused) {
+      recent.push(0);
+      if (recent.length > 8) recent.shift();
+      room.sendInput(proto.encodeInputPacket(seq++, recent));
+      return;
+    }
+    if (!state.started || !state.snap) return;
+    const snap = state.snap;
+    if (!snap.f || snap.f.length < 2) return;
+    const rtt = room.latency();
+    const predict = cfg.predict && rtt ? Math.min(12, Math.round((rtt / 2) / (1000 / 60))) : 0;
+    const me = proto.fighterFromSnap(snap.f[1], state.ourChar, 0);
+    const opp = proto.fighterFromSnap(snap.f[0], state.oppChar || 'modi', predict);
+    state.ourHp = me.hp; state.oppHp = opp.hp;
+    const input = bot.think(me, opp, DT);
+    recent.push(proto.encodeInput(input));
+    if (recent.length > 8) recent.shift();
+    room.sendInput(proto.encodeInputPacket(seq++, recent));
+    state.packets++;
+  }
+
+  function startLoop() {
+    clearInterval(loop);
+    loop = setInterval(tick, Math.max(5, Math.round(1000 / state.hz)));
+  }
+
   (async () => {
     try {
       const norm = normalizeCode(cfg.code);
@@ -57,6 +106,7 @@ function startSession(opts = {}) {
       cfg.code = norm;
       room = await joinRoom({ baseUrl: cfg.url, code: norm, log: say });
       state.status = 'connected';
+      emit({ t: 'status', id, status: state.status });
 
       room.onCtrl = (m) => {
         switch (m.t) {
@@ -68,7 +118,8 @@ function startSession(opts = {}) {
             state.ourChar = m.guest || state.ourPick;
             state.oppChar = m.host || state.hostPick;
             state.started = true;
-            state.status = 'fighting';
+            state.status = state.paused ? 'paused' : 'fighting';
+            emit({ t: 'status', id, status: state.status });
             say(`FIGHT! we=${state.ourChar} vs host=${state.oppChar} (stage ${m.stage})`);
             break;
           case 'ev':
@@ -90,33 +141,19 @@ function startSession(opts = {}) {
       };
       room.onClose = (why) => { say('connection closed: ' + why); finish('closed'); };
 
-      sendTimer = setInterval(() => { if (!state.started) sendLobby(); }, 1500);
+      sendTimer = setInterval(() => { if (!state.started && !state.paused) sendLobby(); }, 1500);
       sendLobby();
-
-      const recent = [];
-      let seq = 0;
-      const DT = 1 / 60;
-      loop = setInterval(() => {
-        if (!state.started || state.ended) return;
-        const snap = state.snap;
-        if (!snap || !snap.f || snap.f.length < 2) return;
-        const rtt = room.latency();
-        const predict = cfg.predict && rtt ? Math.min(12, Math.round((rtt / 2) / (1000 / 60))) : 0;
-        const me = proto.fighterFromSnap(snap.f[1], state.ourChar, 0);
-        const opp = proto.fighterFromSnap(snap.f[0], state.oppChar || 'modi', predict);
-        state.ourHp = me.hp; state.oppHp = opp.hp;
-        const input = bot.think(me, opp, DT);
-        recent.push(proto.encodeInput(input));
-        if (recent.length > 8) recent.shift();
-        room.sendInput(proto.encodeInputPacket(seq++, recent));
-      }, 1000 / 60);
+      startLoop();
 
       statusTimer = setInterval(() => {
         state.rtt = room.latency();
-        if (state.started) say(`hp ${state.ourHp.toFixed(0)} vs ${state.oppHp.toFixed(0)} | timer ${state.timer ?? '-'} | rtt ${state.rtt ?? '-'}ms`);
+        if (state.started && !state.paused) {
+          say(`hp ${state.ourHp.toFixed(0)} vs ${state.oppHp.toFixed(0)} | timer ${state.timer ?? '-'} | rtt ${state.rtt ?? '-'}ms`);
+        }
       }, 1000);
 
-      if (cfg.duration > 0) setTimeout(() => finish('duration'), cfg.duration * 1000);
+      if (cfg.duration > 0) durationTimer = setTimeout(() => finish('duration'), cfg.duration * 1000);
+      emit({ t: 'status', id, status: state.status });
     } catch (e) {
       state.error = e && e.message ? e.message : String(e);
       state.status = 'error';
@@ -129,14 +166,58 @@ function startSession(opts = {}) {
     id,
     state,
     stop: () => finish('stopped'),
+
+    pause() {
+      if (state.ended || state.paused) return false;
+      state.paused = true;
+      if (state.started) state.status = 'paused';
+      say('⏸ paused');
+      emit({ t: 'status', id, status: state.status, paused: true });
+      return true;
+    },
+    resume() {
+      if (state.ended || !state.paused) return false;
+      state.paused = false;
+      if (state.started) state.status = 'fighting';
+      say('▶ resumed');
+      emit({ t: 'status', id, status: state.status, paused: false });
+      return true;
+    },
+    toggle() { return state.paused ? this.resume() : this.pause(); },
+
+    setLevel(diff, overrides) {
+      const lvl = bot.setLevel(diff, overrides);
+      state.level = lvl;
+      say(`level -> ${lvl}${overrides ? ' ' + JSON.stringify(overrides) : ''}`);
+      emit({ t: 'status', id, level: lvl });
+      return lvl;
+    },
+    setChar(c) {
+      state.ourPick = c;
+      bot.setChar(c);
+      state.char = c;
+      if (!state.started) sendLobby();
+      say(`char -> ${c}`);
+      return c;
+    },
+    setHz(hz) {
+      state.hz = Math.max(10, Math.min(120, Number(hz) || 60));
+      startLoop();
+      say(`input rate -> ${state.hz} Hz`);
+      return state.hz;
+    },
+    setPredict(on) { cfg.predict = !!on; return cfg.predict; },
+
+    subscribe(fn) { subs.add(fn); return () => subs.delete(fn); },
+    lines: () => lines.slice(),
     status: () => ({
       id, code: cfg.code, char: state.ourChar, opp: state.oppChar, status: state.status,
       error: state.error, round: state.round, ourHp: state.ourHp, oppHp: state.oppHp,
       timer: state.timer, rtt: state.rtt, started: state.started, ended: state.ended,
+      paused: state.paused, level: state.level, hz: state.hz, packets: state.packets,
       ageSec: Math.round((Date.now() - state.at) / 1000),
     }),
-    lines: () => lines.slice(),
   };
 }
 
-module.exports = { startSession };
+module.exports = { startSession, LEVELS, DEFAULT_LEVEL };

@@ -76,12 +76,80 @@ npm start           # listens on $PORT (default 8080)
 
 | route | description |
 |---|---|
-| `GET /` | small dashboard: enter a code and hit **JOIN ROOM** |
+| `GET /` | dashboard: enter a code, hit **JOIN ROOM**, then pause/resume/change level live over the WebSocket |
 | `GET /join?code=ABCD&char=modi&diff=hard&duration=0` | start a session, returns `{ id }` |
 | `GET /sessions` | JSON list of all sessions with live status |
 | `GET /logs?id=<sid>` | plain-text log for a session |
 | `GET /stop?id=<sid>` | stop a session |
 | `GET /health` | health probe |
+
+---
+
+## Control over WebSocket (`/ws`)
+
+The person who has the room code connects to `ws://<host>/ws` and drives the bot
+from there — **send a room code to launch it, pause/resume mid-fight, and change
+its CPU level live**. Any WebSocket client works (dashboard, phone app, chat bot).
+
+On connect the server pushes a `welcome` (catalog + current sessions). Then:
+
+**Client → server**
+
+| message | effect |
+|---|---|
+| `{t:'join', code, char?, diff?, name?, duration?, hz?, predict?, overrides?}` | join a room and start playing |
+| `{t:'pause', id}` / `{t:'resume', id}` / `{t:'toggle', id}` | pause / resume (fighter goes idle) |
+| `{t:'level', id, diff?, overrides?}` | change difficulty **mid-match** |
+| `{t:'char', id, char}` | change fighter (before start it re-sends the lobby) |
+| `{t:'hz', id, hz}` | change the input send rate (10–120) |
+| `{t:'stop', id}` | end the session |
+| `{t:'list'}` | ask for the current sessions |
+
+**Server → client**
+
+| message | meaning |
+|---|---|
+| `{t:'welcome'}` / `{t:'hello'}` | catalog: `levels`, `profiles`, `chars`, `charAi`, `overrideKeys`, `sessions` |
+| `{t:'joined', id, code, status}` | session created |
+| `{t:'ok', id, action, ...}` | command applied |
+| `{t:'error', message, id?}` | command rejected |
+| `{t:'sessions', sessions:[…]}` | live state, pushed every second |
+| `{t:'log', id, line}` | live log line for a session |
+| `{t:'over', id, status}` | session ended |
+
+### Difficulty levels
+
+The bot uses the game's **own** CPU levels, extracted from the bundle:
+
+* `easy` / `normal` / `hard` — base profiles (`PROFILES` in `ai.js`); the game's
+  default is `normal`.
+* Per-character defaults (`CHAR_AI` in `ai.js`) — the story bosses
+  (`putin`, `melodi`, `hitler`, `kim_jong_un`, `queen_elizabeth`) carry their own
+  `aggression` / `reaction` / `blockChance` / `punishChance` overrides, applied
+  automatically when that fighter is picked.
+* Optional `overrides: { aggression, reaction, blockChance, punishChance, breakChance, superChance, bossRead }`
+  on top, for a fully custom level.
+
+### Example client
+
+```js
+const ws = new WebSocket('ws://localhost:8080/ws');
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.t === 'welcome') ws.send(JSON.stringify({ t: 'join', code: 'ABCD', diff: 'hard' }));
+  if (m.t === 'joined') {
+    setTimeout(() => ws.send(JSON.stringify({ t: 'pause', id: m.id })), 5000);   // freeze it
+    setTimeout(() => ws.send(JSON.stringify({ t: 'level', id: m.id, diff: 'easy' })), 8000);
+  }
+};
+```
+
+`controltest.js` is a ready-made client that joins, then pauses, resumes,
+changes the level twice and stops:
+
+```bash
+WS=ws://localhost:8080/ws node controltest.js ABCD
+```
 
 ---
 
@@ -130,7 +198,8 @@ are behind NAT. Distance dominates the round-trip: a US host vs an India host is
 | `net.js` | WebRTC guest client + signaling + ping/pong |
 | `session.js` | one bot session (join → lobby → start → 60 Hz loop) |
 | `index.js` | CLI entry point |
-| `server.js` | HTTP service + dashboard (Render entry) |
+| `server.js` | HTTP service + WebSocket control channel + dashboard (Render entry) |
 | `selftest.js` | fake-host harness for end-to-end testing |
+| `controltest.js` | WebSocket control-channel test client |
 
 MIT licensed. For educational / personal use.
