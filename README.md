@@ -153,16 +153,15 @@ WS=ws://localhost:8080/ws node controltest.js ABCD
 
 ---
 
-## Multiple users (up to 8 rooms at once)
+## Multiple users (several rooms at once)
 
 One deployment serves several people at the same time. Every controller opens its
 own `/ws` connection, sends **its own room code**, and drives **its own bot** —
 you can pause/level/stop only the sessions you created (HTTP-created sessions are
 open to anyone).
 
-* Capacity is `MAX_SESSIONS` (code default **8**; **this Blueprint ships with `3`**
-  to stay safe on Render's free 0.1-CPU instance — see below). Set it via env var
-  or `render.yaml`.
+* Capacity is `MAX_SESSIONS` (**default 3** — safe on Render's free 0.1-CPU
+  instance; raise it with the env var on a bigger instance).
 * Each room = one WebRTC peer + one 60 Hz input loop. When the server is full,
   `join` returns `{t:'error', message:'server full — N rooms max'}` and `GET /join`
   returns HTTP **429**.

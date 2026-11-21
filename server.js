@@ -22,7 +22,9 @@ const proto = require('./proto');
 const sessions = new Map();
 const clients = new Set();
 const PORT = process.env.PORT || 8080;
-const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 8);
+// Capacity: rooms served at once. Default 3 (safe on Render's free 0.1-CPU plan);
+// raise it with the MAX_SESSIONS env var on a bigger instance.
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 3);
 const CHARS = ['modi', 'rahul', 'didi', 'trump', 'yogi', 'nitin', 'ravi', 'lalu', 'amit', 'dhruv', 'mbapu'];
 const OVERRIDE_KEYS = ['aggression', 'reaction', 'blockChance', 'punishChance', 'breakChance', 'superChance', 'bossRead'];
 
