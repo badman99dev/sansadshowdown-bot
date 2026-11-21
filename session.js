@@ -17,7 +17,7 @@ function startSession(opts = {}) {
   const cfg = {
     code: opts.code,
     char: opts.char || 'modi',
-    diff: opts.diff || 'hard',
+    diff: opts.diff || DEFAULT_LEVEL,
     name: opts.name || 'neta',
     url: (opts.url || 'https://fightkaro.com').replace(/\/$/, ''),
     duration: Number(opts.duration) || 0,

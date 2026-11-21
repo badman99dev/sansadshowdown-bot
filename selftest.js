@@ -30,7 +30,7 @@ function openSignaling() {
   });
 }
 
-async function startHost({ ourChar, oppChar }) {
+async function startHost({ ourChar, oppChar, onOffer, hostOnly }) {
   const sig = await openSignaling();
   log(`room created: ${sig.code} (secret ${sig.secret.slice(0, 6)}…)`);
   const pc = new RTCPeerConnection({ iceServers: (sig.ice && sig.ice.iceServers) || [] });
@@ -43,25 +43,35 @@ async function startHost({ ourChar, oppChar }) {
   while (pc.iceGatheringState !== 'complete' && Date.now() - t0 < 6000) await sleep(100);
   sig.ws.send(JSON.stringify({ t: 'offer', desc: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } }));
   log('offer sent; waiting for guest answer...');
+  // The guest can only join once the offer exists, so start it here — the
+  // answer we are about to wait for is its.
+  if (onOffer) onOffer(sig.code);
 
-  const answer = await new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error('answer timeout')), 60000);
-    sig.ws.on('message', (d) => {
-      let m; try { m = JSON.parse(d.toString()); } catch { return; }
-      if (m.t === 'answer') { clearTimeout(to); resolve(m.desc); }
-      if (m.t === 'close') { clearTimeout(to); reject(new Error('signaling closed')); }
+  // The rest of the handshake (answer → channels open) runs in the background so
+  // the caller gets the code right away. FK_HOST_ONLY prints the code and waits
+  // for an external guest, so it must not block on an answer it never spawns.
+  const handshake = (async () => {
+    const answer = await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('answer timeout')), 60000);
+      sig.ws.on('message', (d) => {
+        let m; try { m = JSON.parse(d.toString()); } catch { return; }
+        if (m.t === 'answer') { clearTimeout(to); resolve(m.desc); }
+        if (m.t === 'close') { clearTimeout(to); reject(new Error('signaling closed')); }
+      });
     });
-  });
-  await pc.setRemoteDescription(answer);
-  sig.ws.send(JSON.stringify({ t: 'sid', sid: sig.secret }));
+    await pc.setRemoteDescription(answer);
+    sig.ws.send(JSON.stringify({ t: 'sid', sid: sig.secret }));
 
-  await new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error('channels timeout')), 45000);
-    const check = () => { if (ctrl.readyState === 'open' && input.readyState === 'open') { clearTimeout(to); resolve(); } };
-    ctrl.onopen = check; input.onopen = check; check();
-  });
-  log('guest connected ✓');
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('channels timeout')), 45000);
+      const check = () => { if (ctrl.readyState === 'open' && input.readyState === 'open') { clearTimeout(to); resolve(); } };
+      ctrl.onopen = check; input.onopen = check; check();
+    });
+    log('guest connected ✓');
+  })().catch((e) => log('host handshake error:', e.message));
 
+  if (hostOnly) return { pc, ctrl, input, code: sig.code, handshake };
+  await handshake;
   return { pc, ctrl, input, code: sig.code };
 }
 
@@ -130,7 +140,18 @@ function beginSnapshots() {
 (async () => {
   const ourChar = process.argv[2] || 'modi';
   const oppChar = process.argv[3] || 'rahul';
-  const host = await startHost({ ourChar, oppChar });
+
+  // run the bot as a child process, started the moment the host publishes its
+  // offer (the handshake waits for the answer, so it cannot be spawned after).
+  let bot = null;
+  const hostOnly = !!process.env.FK_HOST_ONLY;
+  const spawnBot = (code) => {
+    if (bot || hostOnly) return;
+    log('spawning guest bot...');
+    bot = spawn(process.execPath, [path.join(__dirname, 'index.js'), '--code', code, '--char', ourChar, '--diff', 'ultimate', '--duration', '18'], { stdio: 'inherit' });
+  };
+
+  const host = await startHost({ ourChar, oppChar, onOffer: spawnBot, hostOnly });
   const state = {
     started: false, packets: 0, nonZero: 0, snapSeq: 0, lastDecoded: null, lastBits: 0,
     guestPick: null, meHp: 100, oppHp: 100, wins0: 0, wins1: 0, lastInputAt: 0, lastCtrl: 0,
@@ -138,7 +159,7 @@ function beginSnapshots() {
   hostRef = { host, state, ourChar, oppChar };
   attach(host, state);
 
-  if (process.env.FK_HOST_ONLY) {
+  if (hostOnly) {
     log(`HOST_ONLY: room code = ${host.code}`);
     log(`run:  node index.js --code ${host.code} --char ${ourChar}`);
     const stat = setInterval(() => {
@@ -149,10 +170,6 @@ function beginSnapshots() {
     return;
   }
 
-  // run the bot as a child process, pointed at this room
-  log('spawning guest bot...');
-  const bot = spawn(process.execPath, [path.join(__dirname, 'index.js'), '--code', host.code, '--char', ourChar, '--diff', 'hard', '--duration', '18'], { stdio: 'inherit' });
-
   setTimeout(() => {
     log(`--- RESULT ---`);
     log(`started: ${state.started}  input packets received: ${state.packets}  non-zero: ${state.nonZero}`);
@@ -161,7 +178,7 @@ function beginSnapshots() {
     log(`last decoded input: ${JSON.stringify(state.lastDecoded)}`);
     clearInterval(state.snapTimer);
     try { host.pc.close(); } catch {}
-    bot.kill('SIGINT');
+    if (bot) bot.kill('SIGINT');
     setTimeout(() => process.exit(0), 800);
   }, 19000);
 })().catch((e) => { console.error('SELFTEST FAILED:', e.message); process.exit(1); });

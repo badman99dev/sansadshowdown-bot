@@ -23,7 +23,7 @@ function schedule() {
 ws.on('open', () => log('ws open'));
 ws.on('message', (d) => {
   const m = JSON.parse(d.toString());
-  if (m.t === 'welcome') { log('welcome, levels=', m.levels.join('/')); step({ t: 'join', code, char: 'modi', diff: 'hard', hz: 60 }); return; }
+  if (m.t === 'welcome') { log('welcome, levels=', m.levels.join('/')); step({ t: 'join', code, char: 'modi', diff: 'ultimate', hz: 60 }); return; }
   if (m.t === 'joined') { sid = m.id; log('JOINED', sid, m.status); return; }
   if (m.t === 'sessions') {
     if (!sid) return;

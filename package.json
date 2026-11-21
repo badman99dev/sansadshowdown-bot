@@ -7,9 +7,7 @@
     "start": "node server.js",
     "bot": "node index.js",
     "selftest": "node selftest.js",
-    "controltest": "node controltest.js",
-    "hosttest": "node hosttest.js",
-    "servertest": "node servertest.js"
+    "controltest": "node controltest.js"
   },
   "engines": {
     "node": ">=18"

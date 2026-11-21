@@ -1,14 +1,14 @@
 'use strict';
 // fightkaro.com (Sansad Showdown) online bot — headless, pure Node.
 // Joins a friend's room by its 4-char code and plays with the game's own CPU
-// brain (hard profile) driven by live match snapshots, with lag prediction.
+// brain (ultimate profile by default) driven by live match snapshots, with lag prediction.
 //
-//   node index.js --code ABCD [--char modi] [--diff hard|extreme|ultimate] [--name neta]
+//   node index.js --code ABCD [--char modi] [--diff easy|normal|hard|extreme|ultimate] [--name neta]
 
 const { startSession } = require('./session');
 
 function parseArgs(argv) {
-  const a = { char: 'modi', diff: 'hard', url: 'https://fightkaro.com', name: 'neta', duration: 0 };
+  const a = { char: 'modi', diff: 'ultimate', url: 'https://fightkaro.com', name: 'neta', duration: 0 };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i], v = argv[i + 1];
     switch (k) {
