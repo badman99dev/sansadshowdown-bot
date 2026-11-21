@@ -81,7 +81,7 @@ npm start           # listens on $PORT (default 8080)
 | `GET /sessions` | JSON list of all sessions with live status |
 | `GET /logs?id=<sid>` | plain-text log for a session |
 | `GET /stop?id=<sid>` | stop a session |
-| `GET /health` | health probe |
+| `GET /health` | health probe — `{ ok, sessions, active, max, clients }` |
 
 ---
 
@@ -149,6 +149,42 @@ changes the level twice and stops:
 
 ```bash
 WS=ws://localhost:8080/ws node controltest.js ABCD
+```
+
+---
+
+## Multiple users (up to 8 rooms at once)
+
+One deployment serves several people at the same time. Every controller opens its
+own `/ws` connection, sends **its own room code**, and drives **its own bot** —
+you can pause/level/stop only the sessions you created (HTTP-created sessions are
+open to anyone).
+
+* Capacity is `MAX_SESSIONS` (code default **8**; **this Blueprint ships with `3`**
+  to stay safe on Render's free 0.1-CPU instance — see below). Set it via env var
+  or `render.yaml`.
+* Each room = one WebRTC peer + one 60 Hz input loop. When the server is full,
+  `join` returns `{t:'error', message:'server full — N rooms max'}` and `GET /join`
+  returns HTTP **429**.
+* Sessions that ended are garbage-collected after 10 minutes, freeing slots.
+* `/health` reports live usage: `{ "sessions": 3, "active": 3, "max": 8 }`.
+* The dashboard header shows `n/8 rooms`.
+
+> **Free plan note:** Render's free instance is 0.1 CPU / 512 MB. That comfortably
+> holds **~2–3 rooms**; the Blueprint therefore defaults to `MAX_SESSIONS: 3`. For
+> the full **8** concurrent rooms use a paid plan — `0.5c-512mb` (5× the free CPU)
+> or `1c-2g` — and raise `MAX_SESSIONS`. A paid plan also removes the 15-minute
+> idle sleep, so there are no cold starts.
+>
+> Rule of thumb per room: ~15–25 MB RAM and ~0.03 CPU (≈120 network packets/s).
+
+Bumping the cap:
+
+```yaml
+# render.yaml
+envVars:
+  - key: MAX_SESSIONS
+    value: "8"
 ```
 
 ---

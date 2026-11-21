@@ -22,7 +22,7 @@ const proto = require('./proto');
 const sessions = new Map();
 const clients = new Set();
 const PORT = process.env.PORT || 8080;
-const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 6);
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 8);
 const CHARS = ['modi', 'rahul', 'didi', 'trump', 'yogi', 'nitin', 'ravi', 'lalu', 'amit', 'dhruv', 'mbapu'];
 const OVERRIDE_KEYS = ['aggression', 'reaction', 'blockChance', 'punishChance', 'breakChance', 'superChance', 'bossRead'];
 
@@ -42,13 +42,16 @@ function json(res, code, obj) {
 function sendTo(ws, obj) { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } }
 function broadcast(obj) { const s = JSON.stringify(obj); for (const ws of clients) if (ws.readyState === 1) { try { ws.send(s); } catch {} } }
 
-// which session ids did this connection create (so it can control them)
-const owns = new WeakMap();
+// which controller owns each session (null = created over HTTP, open to anyone)
+const owner = new Map();
 
 function createSession(ws, p) {
   gc();
   const active = [...sessions.values()].filter((s) => !s.state.ended).length;
-  if (active >= MAX_SESSIONS) { sendTo(ws, { t: 'error', message: 'too many active sessions' }); return null; }
+  if (active >= MAX_SESSIONS) {
+    sendTo(ws, { t: 'error', message: `server full — ${MAX_SESSIONS} rooms max, try again later` });
+    return null;
+  }
   const overrides = p.overrides && typeof p.overrides === 'object' ? pickOverrides(p.overrides) : undefined;
   const s = startSession({
     code: p.code,
@@ -62,10 +65,20 @@ function createSession(ws, p) {
   });
   s.setLevel(s.state.level, overrides);
   sessions.set(s.id, s);
-  const set = owns.get(ws) || new Set(); set.add(s.id); owns.set(ws, set);
-  s.subscribe((ev) => broadcast(ev));
+  const isWs = ws && ws.readyState === 1;
+  owner.set(s.id, isWs ? ws : null);
+  // route each session's log lines to its own controller; status goes to everyone
+  s.subscribe((ev) => {
+    if (ev.t === 'log') {
+      const o = owner.get(s.id);
+      if (o && o.readyState === 1) sendTo(o, ev); else broadcast(ev);
+    } else {
+      if (ev.t === 'over') owner.delete(s.id);
+      broadcast(ev);
+    }
+  });
   sendTo(ws, { t: 'joined', id: s.id, code: s.status().code, status: s.status().status });
-  broadcast({ t: 'sessions', sessions: listSessions() });
+  broadcast({ t: 'sessions', sessions: listSessions(), max: MAX_SESSIONS });
   return s;
 }
 
@@ -75,9 +88,10 @@ function pickOverrides(o) {
   return Object.keys(out).length ? out : undefined;
 }
 
+// a controller may drive its own sessions (HTTP-created sessions are open to all)
 function canControl(ws, id) {
-  const set = owns.get(ws);
-  return !set || set.has(id) || set.size === 0;
+  const o = owner.get(id);
+  return !o || o === ws;
 }
 
 function handleControl(ws, m) {
@@ -85,7 +99,7 @@ function handleControl(ws, m) {
   switch (m.t) {
     case 'hello':
     case 'list':
-      sendTo(ws, { t: 'hello', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS, charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions() });
+      sendTo(ws, { t: 'hello', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS, charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS });
       break;
     case 'join':
       if (!m.code) return sendTo(ws, { t: 'error', message: 'missing code' });
@@ -192,7 +206,7 @@ const PAGE = (base) => `<!doctype html><html><head><meta charset="utf-8"/>
 </div>
 
 <div class="card">
-  <div class="row" style="justify-content:space-between"><b>Sessions</b><button class="sm" onclick="send({t:'list'})">Refresh</button></div>
+  <div class="row" style="justify-content:space-between"><b>Sessions</b><span id="cap" class="muted"></span><button class="sm" onclick="send({t:'list'})">Refresh</button></div>
   <div id="list" class="sub" style="margin-top:10px">no sessions</div>
 </div>
 
@@ -202,7 +216,7 @@ const PAGE = (base) => `<!doctype html><html><head><meta charset="utf-8"/>
 </div>
 
 <script>
-let ws=null, retry=0;
+let ws=null, retry=0, MAX=8;
 function connect(){
   const proto2 = location.protocol==='https:'?'wss':'ws';
   ws = new WebSocket(proto2+'://'+location.host+'/ws');
@@ -216,7 +230,7 @@ function send(o){ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); else m
 function msg(t,cls){ const m=document.getElementById('msg'); m.innerHTML = cls?'<span class="'+cls+'">'+t+'</span>':t; }
 
 function onMsg(m){
-  if(m.t==='welcome'||m.t==='hello'||m.t==='sessions'){ if(m.sessions) render(m.sessions); }
+  if(m.t==='welcome'||m.t==='hello'||m.t==='sessions'){ if(m.max) MAX=m.max; if(m.sessions){ render(m.sessions); capacity(m.sessions); } }
   else if(m.t==='joined'){ msg('session <code>'+m.id+'</code> started'); }
   else if(m.t==='log'){ const el=document.getElementById('logs'); if(el.textContent==='–')el.textContent=''; el.textContent+=m.line+'\\n'; el.scrollTop=el.scrollHeight; }
   else if(m.t==='error'){ msg(m.message||'error','bad'); }
@@ -254,6 +268,10 @@ function render(rows){
   el.innerHTML=h+'</table>';
 }
 function escapeHtml(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function capacity(rows){
+  const live=rows.filter(r=>!r.ended).length;
+  document.getElementById('cap').textContent=' '+live+'/'+MAX+' rooms';
+}
 connect();
 </script></body></html>`;
 
@@ -280,7 +298,7 @@ const server = http.createServer((req, res) => {
       hz: Number(url.searchParams.get('hz')) || 60,
       predict: url.searchParams.get('predict') !== '0',
     });
-    if (!s) return json(res, 429, { error: 'too many active sessions' });
+    if (!s) return json(res, 429, { error: `server full — ${MAX_SESSIONS} rooms max, try again later` });
     return json(res, 200, { id: s.id, code: s.status().code, status: s.status().status });
   }
 
@@ -300,7 +318,10 @@ const server = http.createServer((req, res) => {
     return json(res, 200, { id: s.id, status: 'stopped' });
   }
 
-  if (p === '/health') return json(res, 200, { ok: true, sessions: sessions.size, clients: clients.size });
+  if (p === '/health') {
+    const active = [...sessions.values()].filter((s) => !s.state.ended).length;
+    return json(res, 200, { ok: true, sessions: sessions.size, active, max: MAX_SESSIONS, clients: clients.size });
+  }
 
   json(res, 404, { error: 'not found' });
 });
@@ -310,7 +331,7 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   sendTo(ws, {
     t: 'welcome', ok: true, levels: LEVELS, profiles: PROFILES, chars: CHARS,
-    charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(),
+    charAi: CHAR_AI, overrideKeys: OVERRIDE_KEYS, sessions: listSessions(), max: MAX_SESSIONS,
   });
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -320,7 +341,10 @@ wss.on('connection', (ws) => {
   ws.on('error', () => clients.delete(ws));
 });
 
-const bcastTimer = setInterval(() => broadcast({ t: 'sessions', sessions: listSessions() }), 1000);
+const bcastTimer = setInterval(() => {
+  gc();
+  broadcast({ t: 'sessions', sessions: listSessions(), max: MAX_SESSIONS });
+}, 1000);
 
 server.listen(PORT, () => console.log(`sansadshowdown-bot listening on :${PORT} (control: ws://<host>:${PORT}/ws)`));
 
